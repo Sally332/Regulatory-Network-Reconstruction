@@ -1,0 +1,218 @@
+#!/usr/bin/env Rscript
+# Gene Regulatory Network Reconstruction (ARACNe)
+
+# ----------------------------------------------
+# 0. Load Libraries
+# ----------------------------------------------
+suppressPackageStartupMessages({
+  library(optparse)          # Command-line argument parsing
+  library(data.table)        # Fast data loading/manipulation
+  library(minet)             # Mutual information computation
+  library(IRanges)           # For gene range operations (if needed)
+  library(clusterProfiler)   # Functional enrichment
+  library(org.Hs.eg.db)      # Human gene annotation
+})
+
+# ----------------------------------------------
+# 1. Parse Command-Line Arguments
+# ----------------------------------------------
+option_list <- list(
+  make_option(c("--expr"), type="character", default=NULL,
+              help="Path to expression matrix (data/expression_matrix_01.txt)", metavar="character"),
+  make_option(c("--tf"), type="character", default=NULL,
+              help="Path to TF list (data/TF_list.txt)", metavar="character"),
+  make_option(c("--cna"), type="character", default=NULL,
+              help="Path to CNA matrix (data/CNA_matrix.txt) or NULL", metavar="character"),
+  make_option(c("--out"), type="character", default="results/network",
+              help="Output prefix (results/network)", metavar="character")
+)
+opt_parser <- OptionParser(option_list=option_list)
+opt <- parse_args(opt_parser)
+
+# Validate required arguments
+if (is.null(opt$expr) || is.null(opt$tf)) {
+  print_help(opt_parser)
+  stop("Error: --expr and --tf are required.\n", call.=FALSE)
+}
+
+# Assign variables from args
+gen_expr_path <- opt$expr     # e.g., "data/expression_matrix_01.txt"
+gen_tf_path   <- opt$tf       # e.g., "data/TF_list.txt"
+gen_cna_path  <- opt$cna      # e.g., "data/CNA_matrix.txt" or "NULL"
+gen_out_pref  <- opt$out      # e.g., "results/network"
+
+# Prepare output directory
+gen_out_dir <- dirname(gen_out_pref)
+if (!dir.exists(gen_out_dir)) {
+  dir.create(gen_out_dir, recursive=TRUE)
+}
+
+# Initialize log file
+gen_log_file <- paste0(gen_out_pref, "_log.txt")
+gen_log_con  <- file(gen_log_file, open="wt")
+writeLines(paste0("[", Sys.time(), "] Starting GRN reconstruction..."), con=gen_log_con)
+
+# ----------------------------------------------
+# 2. Load Expression Matrix
+# ----------------------------------------------
+writeLines("Step 2: Loading expression matrix...", con=gen_log_con)
+expr_df   <- fread(gen_expr_path, data.table=FALSE)
+# First column = gene IDs
+gen_genes <- expr_df[[1]]
+gen_expr_mat <- as.matrix(expr_df[, -1])
+rownames(gen_expr_mat) <- gen_genes
+writeLines(paste0("Loaded expression data: ", nrow(gen_expr_mat), " genes x ", ncol(gen_expr_mat), " samples."), con=gen_log_con)
+
+# ----------------------------------------------
+# 3. Load TF List
+# ----------------------------------------------
+writeLines("Step 3: Loading TF list...", con=gen_log_con)
+tf_vector <- fread(gen_tf_path, header=FALSE, data.table=FALSE)[[1]]
+writeLines(paste0("Loaded ", length(tf_vector), " TFs."), con=gen_log_con)
+
+# ----------------------------------------------
+# 4. (Optional) Load CNA Matrix
+# ----------------------------------------------
+use_cna <- FALSE
+if (!is.null(gen_cna_path) && file.exists(gen_cna_path) && gen_cna_path != "NULL") {
+  writeLines("Step 4: Loading CNA matrix...", con=gen_log_con)
+  cna_df  <- fread(gen_cna_path, data.table=FALSE)
+  rownames(cna_df) <- cna_df[[1]]           # First column = gene IDs
+  gen_cna_mat <- as.matrix(cna_df[, -1])
+  use_cna  <- TRUE
+  writeLines("CNA matrix loaded for MI adjustment.", con=gen_log_con)
+} else {
+  writeLines("No CNA adjustment will be applied.", con=gen_log_con)
+}
+
+# ----------------------------------------------
+# 5. Preprocess Expression Data
+# ----------------------------------------------
+writeLines("Step 5: Preprocessing expression data...", con=gen_log_con)
+# 5a. Log2 transform if necessary
+if (any(gen_expr_mat < 0)) {
+  gen_expr_mat <- log2(gen_expr_mat + 1)
+  writeLines("Applied log2(TPM+1) transformation.", con=gen_log_con)
+}
+
+# 5b. Filter low-expression genes
+expr_thresh   <- 1
+expr_frac     <- 0.5
+keep_idx      <- rowSums(gen_expr_mat > expr_thresh) >= (ncol(gen_expr_mat) * expr_frac)
+gen_expr_filt <- gen_expr_mat[keep_idx, ]
+writeLines(paste0("Filtered genes: ", nrow(gen_expr_mat), " -> ", nrow(gen_expr_filt)), con=gen_log_con)
+
+# 5c. Filter TFs present in filtered data
+enf_tf_list <- intersect(tf_vector, rownames(gen_expr_filt))
+writeLines(paste0("TFs after filtering: ", length(enf_tf_list)), con=gen_log_con)
+
+# ----------------------------------------------
+# 6. Mutual Information & Edge List
+# ----------------------------------------------
+writeLines("Step 6: Calculating mutual information (MI) and building edge list...", con=gen_log_con)
+mi_edges <- data.frame(TF=character(), Target=character(), MI=numeric(), stringsAsFactors=FALSE)
+
+# Loop through each filtered TF
+for (tf in enf_tf_list) {
+  writeLines(paste0("-- Processing TF: ", tf), con=gen_log_con)
+  tf_exp_vec <- gen_expr_filt[tf, , drop=TRUE]
+  num_genes  <- nrow(gen_expr_filt)
+  mi_vals    <- numeric(num_genes)
+  gene_names <- rownames(gen_expr_filt)
+
+  # Compute MI for TF vs. all genes
+  for (i in seq_len(num_genes)) {
+    gene_name  <- gene_names[i]
+    mi_vals[i] <- mutinformation(discretize(tf_exp_vec), discretize(gen_expr_filt[gene_name, ]))
+  }
+  names(mi_vals) <- gene_names
+
+  # Threshold MI (e.g., > 0.05) to select direct targets
+  mi_thresh       <- 0.05
+  direct_targets  <- which(mi_vals > mi_thresh)
+
+  # 6a. Adjust MI using CNA if available
+  if (use_cna) {
+    cna_tf        <- gen_cna_mat[tf, ]
+    for (idx in direct_targets) {
+      gene2      <- gene_names[idx]
+      cna_gene2  <- gen_cna_mat[gene2, ]
+      corr_coef  <- cor(cna_tf, cna_gene2, method="pearson")
+      if (!is.na(corr_coef) && abs(corr_coef) > 0.5) {
+        mi_vals[idx] <- mi_vals[idx] * (1 - abs(corr_coef))
+      }
+    }
+    # Recompute direct targets after CNA adjustment
+    direct_targets <- which(mi_vals > mi_thresh)
+  }
+
+  # 6b. Append MI edges to edge list
+  if (length(direct_targets) > 0) {
+    new_df <- data.frame(
+      TF     = rep(tf, length(direct_targets)),
+      Target = gene_names[direct_targets],
+      MI     = mi_vals[direct_targets],
+      stringsAsFactors = FALSE
+    )
+    mi_edges <- rbind(mi_edges, new_df)
+  }
+}
+
+# Write MI edge list to file
+gen_edge_file <- paste0(gen_out_pref, "_ARACNe_edges.txt")
+write.table(mi_edges, file=gen_edge_file, sep="\t", row.names=FALSE, quote=FALSE)
+writeLines(paste0("ARACNe edge list saved: ", gen_edge_file), con=gen_log_con)
+
+# ----------------------------------------------
+# 7. Variant Set Enrichment (VSE)
+# ----------------------------------------------
+writeLines("Step 7: Performing Variant Set Enrichment (VSE)...", con=gen_log_con)
+gwas_list   <- fread("data/gwas_loci.txt", header=FALSE, data.table=FALSE)[[1]]
+net_targets <- unique(mi_edges$Target)
+
+# Build contingency table
+overlap_flag <- net_targets %in% gwas_list
+cont_tab <- matrix(c(
+  sum(overlap_flag),                 # network & GWAS
+  sum(!overlap_flag),                # network & not GWAS
+  sum(gwas_list %in% net_targets == FALSE),  # GWAS & not network
+  length(unique(c(net_targets, gwas_list))) - sum(overlap_flag) - sum(!overlap_flag) - sum(gwas_list %in% net_targets == FALSE)
+), nrow=2)
+
+# Fisher's Exact Test
+vse_test  <- fisher.test(cont_tab)
+vse_res   <- data.frame(OddsRatio=vse_test$estimate, P.Value=vse_test$p.value)
+gen_vse_file <- paste0(gen_out_pref, "_VSE_results.tsv")
+write.table(vse_res, file=gen_vse_file, sep="\t", row.names=FALSE, quote=FALSE)
+writeLines(paste0("VSE results saved: ", gen_vse_file), con=gen_log_con)
+
+# ----------------------------------------------
+# 8. Master Regulator Ranking
+# ----------------------------------------------
+writeLines("Step 8: Ranking master regulators...", con=gen_log_con)
+tf_summary <- aggregate(MI ~ TF, data=mi_edges, FUN=function(x) c(count=length(x), mean_MI=mean(x)))
+
+tf_summary$count   <- sapply(tf_summary$MI, `[`, "count")
+tf_summary$mean_MI <- sapply(tf_summary$MI, `[`, "mean_MI")
+tf_summary$MI      <- NULL
+
+tf_summary$GWAS_ovlp <- sapply(tf_summary$TF, function(tf) {
+  targets <- mi_edges$Target[mi_edges$TF == tf]
+  sum(targets %in% gwas_list)
+})
+
+tf_summary$Score    <- with(tf_summary, count * mean_MI + GWAS_ovlp)
+tf_ranked           <- tf_summary[order(-tf_summary$Score), ]
+
+gen_mr_file <- paste0(gen_out_pref, "_MR_ranking.tsv")
+write.table(tf_ranked, file=gen_mr_file, sep="\t", row.names=FALSE, quote=FALSE)
+writeLines(paste0("Master regulator ranking saved: ", gen_mr_file), con=gen_log_con)
+
+# ----------------------------------------------
+# 9. Session Info & Logging
+# ----------------------------------------------
+writeLines("Step 9: Saving session info and closing log...", con=gen_log_con)
+writeLines(capture.output(sessionInfo()), con=gen_log_con)
+close(gen_log_con)
+
+# End of script
