@@ -20,9 +20,8 @@ GWAS and transcriptomic studies reveal that many disease‐associated loci influ
 
 For full details on each step, see the **README** (docs/README.pdf) and **HPC instructions** in `hpc/`.
 
-Contact & License
+## Contact & License
 Author: Sally Yepes (sallyepes233@gmail.com)
-
 License: MIT
 
-Last Updated: June 2025
+
